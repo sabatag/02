@@ -720,16 +720,19 @@ def check_positions(users):
                     # Получаем реальный PNL от API
                     unrealized_pnl = float(api_pos["unrealisedPnl"])
                     position_value = float(api_pos["positionValue"])
+                    leverage = float(api_pos["leverage"]) if api_pos["leverage"] else 1.0  # По умолчанию 1x если пусто
                     
                     if position_value == 0:
                         continue
                     
-                    # Рассчитываем PNL в процентах от стоимости позиции
-                    pnl_percent = unrealized_pnl / position_value
+                    # Рассчитываем PNL в процентах от стоимости позиции с учетом плеча
+                    pnl_percent_raw = unrealized_pnl / position_value
+                    pnl_percent = pnl_percent_raw * leverage  # Умножаем на leverage
+                    
                     avg_entry_price = float(api_pos["avgPrice"])
                     current_price = float(api_pos["markPrice"])
                     
-                    logging.info(f"{user_id}: Checking {symbol}, avg_entry_price={avg_entry_price}, current_price={current_price}, unrealized_pnl={unrealized_pnl:.4f} USDT, pnl_percent={pnl_percent:.4f} ({pnl_percent*100:.2f}%)")
+                    logging.info(f"{user_id}: Checking {symbol}, avg_entry_price={avg_entry_price}, current_price={current_price}, unrealized_pnl={unrealized_pnl:.4f} USDT, leverage={leverage}x, pnl_percent={pnl_percent:.4f} ({pnl_percent*100:.2f}%)")
                     
                     # Если PNL достиг триггера (15%), начинаем логику тейк-профита
                     if pnl_percent >= TAKE_PROFIT_TRIGGER:
