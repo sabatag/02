@@ -172,7 +172,7 @@ def cancel_docoup_orders(session, user_id, symbol):
 # Установка тейк-профита на основе PNL
 def set_take_profit_order_by_pnl(session, user_id, symbol, qty, entry_price, take_profit_pnl_percent, min_order_qty, max_order_qty, lot_step_size):
     try:
-        # Рассчитываем цену тейк-профита на основе PNL
+        # Рассчитываем цену тейк-профита на основе процента PNL от entry_price
         take_profit_price = entry_price * (1 + take_profit_pnl_percent)
         
         # Округляем количество в соответствии с требованиями API
@@ -180,7 +180,17 @@ def set_take_profit_order_by_pnl(session, user_id, symbol, qty, entry_price, tak
         qty = min(qty, max_order_qty)
         qty = min_order_qty + (round((qty - min_order_qty) / lot_step_size) * lot_step_size)
         
-        # Сначала отменяем существующие тейк-профит ордера
+        # Проверим, есть ли уже активные take-profit ордера
+        existing_tp_orders = get_existing_take_profit_orders(session, user_id, symbol)
+        
+        # Если уже есть take-profit ордер с такой же ценой, не создаем дублирующий
+        for existing_order in existing_tp_orders:
+            existing_price = float(existing_order["price"])
+            if abs(existing_price - take_profit_price) < 0.01:  # Допуск 0.01
+                logging.info(f"{user_id}: Take-profit order for {symbol} already exists at {existing_price} (target: {take_profit_price})")
+                return True
+        
+        # Сначала отменяем существующие тейк-профит ордера (для обновления уровня)
         cancel_take_profit_orders(session, user_id, symbol)
         
         response = session.place_order(
@@ -206,6 +216,25 @@ def set_take_profit_order_by_pnl(session, user_id, symbol, qty, entry_price, tak
     except Exception as e:
         logging.error(f"{user_id}: Error setting take-profit order for {symbol}: {e}")
         return False
+
+# Получение существующих take-profit ордеров
+def get_existing_take_profit_orders(session, user_id, symbol):
+    try:
+        response = session.get_open_orders(category="linear", symbol=symbol)
+        if response["retCode"] != 0:
+            logging.error(f"{user_id}: Failed to get open orders for {symbol}: {response['retMsg']} (ErrCode: {response['retCode']})")
+            return []
+        
+        # Фильтруем только reduceOnly ордера (take-profit)
+        take_profit_orders = []
+        for order in response["result"]["list"]:
+            if order.get("reduceOnly") == True and order.get("side") == "Sell":
+                take_profit_orders.append(order)
+        
+        return take_profit_orders
+    except Exception as e:
+        logging.error(f"{user_id}: Error getting existing take-profit orders for {symbol}: {e}")
+        return []
 
 # Отмена тейк-профит ордеров
 def cancel_take_profit_orders(session, user_id, symbol):
@@ -670,41 +699,56 @@ def check_positions(users):
             except Exception as e:
                 logging.error(f"{user_id}: Error checking pending docoup orders: {e}")
             
-            # Проверка тейк-профита на основе PNL
-            unique_symbols = set(pos["symbol"] for pos in positions if pos["is_main"])
+            # Проверка тейк-профита на основе реального PNL от API Bybit
+            try:
+                # Получаем реальные позиции от API
+                response = session.get_positions(category="linear", settleCoin="USDT")
+                if response["retCode"] != 0:
+                    logging.error(f"{user_id}: Failed to get positions from API: {response['retMsg']} (ErrCode: {response['retCode']})")
+                    continue
+                
+                api_positions = response["result"]["list"]
+                
+                for api_pos in api_positions:
+                    symbol = api_pos["symbol"]
+                    size = float(api_pos["size"])
+                    
+                    # Пропускаем позиции с нулевым размером
+                    if size == 0:
+                        continue
+                    
+                    # Получаем реальный PNL от API
+                    unrealized_pnl = float(api_pos["unrealisedPnl"])
+                    position_value = float(api_pos["positionValue"])
+                    
+                    if position_value == 0:
+                        continue
+                    
+                    # Рассчитываем PNL в процентах от стоимости позиции
+                    pnl_percent = unrealized_pnl / position_value
+                    avg_entry_price = float(api_pos["avgPrice"])
+                    current_price = float(api_pos["markPrice"])
+                    
+                    logging.info(f"{user_id}: Checking {symbol}, avg_entry_price={avg_entry_price}, current_price={current_price}, unrealized_pnl={unrealized_pnl:.4f} USDT, pnl_percent={pnl_percent:.4f} ({pnl_percent*100:.2f}%)")
+                    
+                    # Если PNL достиг триггера (15%), начинаем логику тейк-профита
+                    if pnl_percent >= TAKE_PROFIT_TRIGGER:
+                        # Рассчитываем текущий уровень тейк-профита
+                        steps_above_trigger = int((pnl_percent - TAKE_PROFIT_TRIGGER) / TAKE_PROFIT_STEP)
+                        current_take_profit_level = TAKE_PROFIT_INITIAL + steps_above_trigger * TAKE_PROFIT_STEP
+                        
+                        # Получаем параметры для ордера
+                        available, min_order_qty, max_order_qty, lot_step_size = check_ticker(session, symbol, user_id)
+                        if available:
+                            # Устанавливаем новый тейк-профит
+                            set_take_profit_order_by_pnl(session, user_id, symbol, size, avg_entry_price, current_take_profit_level, min_order_qty, max_order_qty, lot_step_size)
+                            logging.info(f"{user_id}: {symbol} PNL={pnl_percent:.4f} ({pnl_percent*100:.2f}%), updated take-profit to {current_take_profit_level*100:.1f}%")
+                    
+                    elif pnl_percent >= TAKE_PROFIT_INITIAL:
+                        logging.info(f"{user_id}: {symbol} PNL={pnl_percent:.4f} ({pnl_percent*100:.2f}%), approaching take-profit trigger ({TAKE_PROFIT_TRIGGER*100:.1f}%)")
             
-            for symbol in unique_symbols:
-                if symbol not in positions_prices:
-                    logging.warning(f"{user_id}: No price data for {symbol}, skipping")
-                    continue
-                
-                current_price, _ = positions_prices[symbol]
-                avg_entry_price = get_position_average_price(user_id, symbol)
-                
-                if avg_entry_price is None:
-                    continue
-                
-                pnl = (current_price - avg_entry_price) / avg_entry_price
-                logging.info(f"{user_id}: Checking {symbol}, avg_entry_price={avg_entry_price}, current_price={current_price}, pnl={pnl:.4f}")
-                
-                # Если PNL достиг триггера (15%), начинаем логику тейк-профита
-                if pnl >= TAKE_PROFIT_TRIGGER:
-                    # Рассчитываем текущий уровень тейк-профита
-                    steps_above_trigger = int((pnl - TAKE_PROFIT_TRIGGER) / TAKE_PROFIT_STEP)
-                    current_take_profit_level = TAKE_PROFIT_INITIAL + steps_above_trigger * TAKE_PROFIT_STEP
-                    
-                    # Получаем общее количество для тейк-профита
-                    total_qty = sum(p["qty"] for p in positions if p["symbol"] == symbol)
-                    
-                    # Получаем параметры для ордера
-                    available, min_order_qty, max_order_qty, lot_step_size = check_ticker(session, symbol, user_id)
-                    if available:
-                        # Устанавливаем новый тейк-профит
-                        set_take_profit_order_by_pnl(session, user_id, symbol, total_qty, avg_entry_price, current_take_profit_level, min_order_qty, max_order_qty, lot_step_size)
-                        logging.info(f"{user_id}: {symbol} PNL={pnl:.4f}, updated take-profit to {current_take_profit_level*100:.1f}%")
-                
-                elif pnl >= TAKE_PROFIT_INITIAL:
-                    logging.info(f"{user_id}: {symbol} PNL={pnl:.4f}, approaching take-profit trigger ({TAKE_PROFIT_TRIGGER*100:.1f}%)")
+            except Exception as e:
+                logging.error(f"{user_id}: Error checking positions for take-profit: {e}")
         
         time.sleep(15)
 
